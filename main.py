@@ -7,6 +7,8 @@ import yfinance as yf
 import copy
 import cvxopt
 import quantstats as qs
+import psycopg2
+import psycopg2.extras
 
 
 from contextlib import contextmanager, redirect_stdout
@@ -29,7 +31,116 @@ from pypfopt.plotting import plot_dendrogram
 from pypfopt.discrete_allocation import DiscreteAllocation, get_latest_prices
 from pypfopt.expected_returns import returns_from_prices
 
+
 #from concurrent.futures import ThreadPoolExecutor
+
+
+st.set_page_config(page_title='PortfolioLab', page_icon='static/icon.ico')
+
+
+
+@st.experimental_singleton
+def init_connection():
+    return psycopg2.connect(**st.secrets["postgres"])
+
+connection = init_connection()
+
+cursor = connection.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+
+
+def fetch_info(asset):
+
+    data = yf.Ticker(asset)
+    asset_info = data.info
+
+    keys = ['symbol', 'longName', 'exchange', 'quoteType']
+
+    if None not in list(map(asset_info.get, keys)):
+        
+        symbol = asset_info['symbol']
+        name = asset_info['longName']
+        exchange = asset_info['exchange']
+        asset_class = asset_info['quoteType']
+
+        
+        sector_key = 'sector'
+        if asset_info.get(sector_key) is not None:
+            sector = asset_info['sector']
+        else:
+            sector = 'sector undefined'
+
+        info2 = st.info(f"{asset} data fetched.")
+        return info2, symbol, name, exchange, asset_class, sector
+    
+    else:
+        info2 = st.warning(f"Impossible to find {asset} data in yfinance, try another ticker.")
+        return info2, None
+
+
+
+@st.experimental_singleton
+def fetch_assets_info(tickers):
+
+    data = {}
+    sector_mapper = {}
+
+    for ticker in tickers:
+        cursor.execute("""
+        SELECT * FROM asset WHERE symbol = %s
+        """, (ticker,))
+        
+        asset_data = cursor.fetchone()
+        
+        if asset_data:
+            data[ticker] = asset_data
+            sector_mapper[ticker] = asset_data['sector']
+            
+        else:
+            info1 = st.info(f"{ticker} data not in DB. Fetching data from yfinance...")
+            info2, symbol, name, exchange, asset_class, sector, market_cap = fetch_info(ticker)
+
+            cursor.execute("""
+                    INSERT INTO asset (symbol, name, exchange, asset_class, sector)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol) DO NOTHING
+            """, (symbol, name, exchange, asset_class, sector))
+
+            connection.commit()
+            info1.empty()
+            info2.empty()
+
+            st.success(f"{symbol} ({name}) added to database.")
+
+            cursor.execute("""
+            SELECT * FROM asset WHERE symbol = %s
+            """, (ticker,))
+        
+            asset_data = cursor.fetchone()
+            data[ticker] = asset_data
+            sector_mapper[ticker] = asset_data['sector']
+
+    return data, sector_mapper
+
+
+
+@st.experimental_singleton
+def fetch_mcaps(tickers):
+    mcaps = {}
+    for ticker in tickers:
+
+        data = yf.Ticker(ticker)
+        asset_info = data.info
+
+        key = asset_info['quoteType']
+
+        if key == 'ETF' or key == 'MUTUALFUND':
+            mcaps[ticker] = asset_info['totalAssets']
+        else:
+            mcaps[ticker] = asset_info['marketCap']
+
+    return mcaps
+
 
 
 @contextmanager
@@ -56,39 +167,9 @@ def fetch_prices(ticker):
 
 
 
-@st.experimental_singleton
-def fetch_info(asset):
-
-    data = yf.Ticker(asset)
-    asset_info = data.info
-
-    keys = ['symbol', 'longName', 'exchange', 'quoteType']
-
-    if None not in list(map(asset_info.get, keys)):
-        
-        symbol = asset_info['symbol']
-        name = asset_info['longName']
-        exchange = asset_info['exchange']
-        asset_class = asset_info['quoteType']
-
-        if asset_class == 'ETF' or asset_class == 'MUTUALFUND':
-            market_cap = asset_info['totalAssets']
-        else:
-            market_cap = asset_info['marketCap']
-
-        sector_key = 'sector'
-        if asset_info.get(sector_key) is not None:
-            sector = asset_info['sector']
-        else:
-            sector = 'sector undefined'
-    
-        return symbol, name, exchange, asset_class, sector, market_cap
-    
-    else:
-        return None
 
 
-st.set_page_config(page_title='PortfolioLab', page_icon='static/icon.ico')
+
 
 st.title('Welcome to PortfolioLab')
 st.markdown("<p>Portfolio optimizer. Built w/ <a href=https://pyportfolioopt.readthedocs.io/en/latest/index.html>PyPortfolioOpt</a> and <a href=https://github.com/ranaroussi/quantstats>QuantStats</a>.</p>", unsafe_allow_html=True)
@@ -102,7 +183,7 @@ with st.form(key='tick_form'):
     tickers = st.text_input(label='Add asset tickers:', placeholder='Enter tickers', help='Insert space separated symbols; Use Yahoo Finance classification system for identifying instruments.', value="AAPL KO BAC AXP KHC")
     submit_button = st.form_submit_button(label='Add tickers')
 
-holdings = pd.DataFrame(columns=['Symbol', 'Name', 'Exchange', 'Asset Class', 'Sector', 'Market Cap'])
+
 
 
 
@@ -110,46 +191,22 @@ if tickers:
     
     st.subheader('Portfolio holdings:')
 
-    sector_mapper = {}
-    symbols = []
-    for ticker in tickers.split(' '):
-        r = fetch_info(ticker)
-        if r != None:
-            symbol, name, exchange, asset_class, sector, market_cap = r
-            symbols.append(symbol)
-            sector_mapper[symbol] = sector
+    symbols = tickers.split(' ')
 
-            holdings = holdings.append({
-                'Symbol': symbol,
-                'Name': name,
-                'Exchange': exchange,
-                'Asset Class': asset_class,
-                'Sector': sector,
-                'Market Cap': market_cap,
-            }, ignore_index=True)
+    asset_info, sector_mapper = fetch_assets_info(symbols)
+
+    holdings=pd.DataFrame(data=asset_info.values(), columns=['id', 'Symbol', 'Name', 'Exchange', 'Asset Class', 'Sector'])
+
+    fil_syms = holdings['Symbol'].tolist()
+
+   
+
+   
 
     st.write(holdings)
 
 
-    #with ThreadPoolExecutor(max_workers=16) as pool:
-        #results = pool.map(fetch_info, tickers.split(' '))
-            
-    # sector_mapper = {}
-    # symbols = []
-    # for r in results:
-    #     if r is not None:
-    #         (symbol, name, exchange, asset_class, sector) = r
-    #         symbols.append(symbol)
-    #         sector_mapper[symbol] = sector
-
-    #         holdings = holdings.append({
-    #             'Symbol': symbol,
-    #             'Name': name,
-    #             'Exchange': exchange,
-    #             'Asset Class': asset_class,
-    #             'Sector': sector,
-    #         }, ignore_index=True)
-
+    
 
 
     df1 = fetch_prices(symbols)
@@ -350,9 +407,9 @@ if tickers:
 
 
         else:
-            mcap_df = holdings.set_index('Symbol')['Market Cap']
+            
 
-            market_caps_d = mcap_df.to_dict()
+            market_caps_d = fetch_mcaps(fil_syms)
 
             if any(pd.isnull(mc) for mc in market_caps_d.values()):
                 with st.expander('Market Caps', expanded=True):

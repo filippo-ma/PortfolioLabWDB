@@ -15,3 +15,7 @@ CREATE TABLE asset_price (
     PRIMARY KEY (asset_id, dt),
     CONSTRAINT fk_asset FOREIGN KEY (asset_id) REFERENCES asset (id)
 );
+
+CREATE INDEX ON asset_price (asset_id, dt DESC);
+
+SELECT create_hypertable('asset_price', 'dt');

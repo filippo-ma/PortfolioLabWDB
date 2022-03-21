@@ -192,6 +192,30 @@ def fetch_assets_info(tickers):
 
 
 
+def insert_asset_into_db(symbols):
+
+    print('Fetching data from yfinance...')
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = pool.map(get_asset_data, symbols)
+        
+    for r in results:
+        if r is not None:
+            (symbol, name, exchange, asset_class, sector) = r
+
+            cursor.execute("""
+                    INSERT INTO asset (symbol, name, exchange, asset_class, sector)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol) DO NOTHING
+            """, (symbol, name, exchange, asset_class, sector))
+
+            connection.commit()
+            print(f"{symbol} ({name}) added to DB.")
+
+
+
+
+
 # myinfo, sector_mapper = retrieve_assets(symbols_test)
 
 # print(myinfo)
